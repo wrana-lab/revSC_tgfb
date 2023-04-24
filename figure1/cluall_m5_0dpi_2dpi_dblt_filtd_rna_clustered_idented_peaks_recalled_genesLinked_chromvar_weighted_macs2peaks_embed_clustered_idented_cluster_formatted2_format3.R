@@ -1,0 +1,13 @@
+setwd("/media/shyam/external/multiome_clu_2/multi5")
+library(Seurat)
+library(Signac)
+load("/media/shyam/external/multiome_clu_2/multi5/cluall_m5_0dpi_2dpi_dblt_filtd_rna_clustered_idented_peaks_recalled_genesLinked_chromvar_weighted_macs2peaks_embed_clustered_idented_cluster_formatted2.RData")
+Idents(clu) <- clu$collapse_idents
+clu <- SetIdent(clu, cells = WhichCells(clu, expression = new_wnn_clusters %in% c('EC-W1', 'EC-W14')), value = 'CVJ')
+clu <- SetIdent(clu, cells = WhichCells(clu, expression = new_wnn_clusters %in% c('EC-W3', 'EC-W4')), value = 'Villus Bottom')
+clu <- SetIdent(clu, cells = WhichCells(clu, expression = new_wnn_clusters %in% c('EC-W7', 'EC-W2')), value = 'Anoikis Like')
+clu <- SetIdent(clu, cells = WhichCells(clu, expression = new_wnn_clusters %in% c('EC-W11', 'EC-W10', 'EC-W5')), value = 'Villus Top')
+clu$new_collapse_idents <- Idents(clu)
+DimPlot(clu, reduction = 'wnn.umap',label = T)
+save(clu, file = 'cluall_m5_0dpi_2dpi_dblt_filtd_rna_clustered_idented_peaks_recalled_genesLinked_chromvar_weighted_macs2peaks_embed_clustered_idented_cluster_formatted2_format3.RData')
+savehistory("/media/shyam/external/multiome_clu_2/multi5/cluall_m5_0dpi_2dpi_dblt_filtd_rna_clustered_idented_peaks_recalled_genesLinked_chromvar_weighted_macs2peaks_embed_clustered_idented_cluster_formatted2_format3.R")

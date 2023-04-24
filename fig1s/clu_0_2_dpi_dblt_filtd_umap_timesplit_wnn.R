@@ -1,0 +1,30 @@
+setwd("~/pCloudDrive/multiome_work/multi5")
+library(Seurat)
+library(Signac)
+load("~/pCloudDrive/multiome_work/multi5/cluall_m5_0dpi_2dpi_dblt_filtd_rna_clustered_idented_peaks_recalled_genesLinked_chromvar_weighted_macs2peaks_embed_clustered_idented_cluster_formatted2_format3_chromvar2_jaspar2022only_newcollapse2_rezonationed_mean.RData")
+Idents(clu) <- clu$new_wnn_clusters
+levels(clu)
+levels(clu) <- c(grep('^RevSC', levels(clu), value = T) ,grep('^ICC', levels(clu), value = T),grep('^PC', levels(clu), value = T), 'EC-W1', 'EC-W2', 'EC-W10', 'EC-W14', 'EC-W4', 'EC-W7', 'EC-W11','EC-W5', 'EC-W3', grep('^GC', levels(clu), value = T), grep('^EE', levels(clu), value = T), grep('^TC', levels(clu), value = T),grep('^Fibro', levels(clu), value = T), grep('^Immune', levels(clu), value = T))
+library(ggplot2)
+##modality
+df <- data.frame(matrix(nrow = length(levels(clu)), ncol = 2))
+###wnn umap
+df <- data.frame(wnnUMAP1 = Embeddings(clu, 'wnn.umap')[,1], wnnUMAP2 = Embeddings(clu, 'wnn.umap')[,2], ClusterNumber = clu$wnn_clusters, ClusterName = clu$new_wnn_clusters)
+library(tidyverse)
+df_label <- df %>% group_by(ClusterNumber) %>% summarize(wnnUMAP1 = mean(wnnUMAP1), wnnUMAP2 = mean(wnnUMAP2))
+df$ClusterName <- factor(df$ClusterName, levels=levels(clu))
+ggplot(df, aes(x = wnnUMAP1, y = wnnUMAP2)) + geom_point(size = 0.5, shape = 16, aes(color = ClusterName)) + geom_text(data = df_label, aes(label = ClusterNumber)) + theme(panel.background = element_rect(fill = 'white'), axis.line = element_line(size = 1, color = 'black'), axis.text = element_text(size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), text = element_text(size = 12), legend.key = element_rect(fill = 'white')) + guides(color = guide_legend(override.aes = list(size = 3) ) ) + labs(color = 'WNN Clusters')
+FeaturePlot(clu, features = c('Lyz2', 'Csf1r'))
+FeaturePlot(clu, features = c('Lyz2', 'Csf1r'), reduction = 'wnn.umap')
+DimPl
+DimPlot(clu, label = T, reduction = 'wnn.umap')
+immune_markers17 <- FindMarkers(clu, ident.1 = 'Immune-W17', only.pos = T)
+View(immune_markers17)
+###wnn umap
+df <- data.frame(wnnUMAP1 = Embeddings(clu, 'wnn.umap')[,1], wnnUMAP2 = Embeddings(clu, 'wnn.umap')[,2], ClusterNumber = clu$wnn_clusters, Day = clu$time)
+library(tidyverse)
+df_label <- df %>% group_by(ClusterNumber) %>% summarize(wnnUMAP1 = mean(wnnUMAP1), wnnUMAP2 = mean(wnnUMAP2))
+ggplot(df, aes(x = wnnUMAP1, y = wnnUMAP2)) + geom_point(size = 0.5, shape = 16, aes(color = Day)) + geom_text(data = df_label, aes(label = ClusterNumber)) + theme(panel.background = element_rect(fill = 'white'), axis.line = element_line(size = 1, color = 'black'), axis.text = element_text(size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), text = element_text(size = 12), legend.key = element_rect(fill = 'white')) + guides(color = guide_legend(override.aes = list(size = 3) ) ) + labs(color = 'WNN Clusters')
+ggplot(df, aes(x = wnnUMAP1, y = wnnUMAP2)) + geom_point(size = 0.5, shape = 16, aes(color = Day)) + scale_color_manual(values = c('#2166AC', '#B2182B')) geom_text(data = df_label, aes(label = ClusterNumber)) + theme(panel.background = element_rect(fill = 'white'), axis.line = element_line(size = 1, color = 'black'), axis.text = element_text(size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), text = element_text(size = 12), legend.key = element_rect(fill = 'white')) + guides(color = guide_legend(override.aes = list(size = 3) ) ) + labs(color = 'WNN Clusters')
+ggplot(df, aes(x = wnnUMAP1, y = wnnUMAP2)) + geom_point(size = 0.5, shape = 16, aes(color = Day)) + scale_color_manual(values = c('#2166AC', '#B2182B')) + geom_text(data = df_label, aes(label = ClusterNumber)) + theme(panel.background = element_rect(fill = 'white'), axis.line = element_line(size = 1, color = 'black'), axis.text = element_text(size = 12), axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12), text = element_text(size = 12), legend.key = element_rect(fill = 'white')) + guides(color = guide_legend(override.aes = list(size = 3) ) ) + labs(color = 'WNN Clusters')
+savehistory("~/pCloudDrive/multiome_work/multi5/clu_0_2_dpi_dblt_filtd_umap_timesplit_wnn.R")
