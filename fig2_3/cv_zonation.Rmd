@@ -1,0 +1,2318 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(Signac)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(tidyverse)
+library(slingshot)
+library(tradeSeq)
+library(ComplexHeatmap)
+library(circlize)
+library(Hmisc)
+library(RColorBrewer)
+library(ggridges)
+```
+
+
+# Load processed data
+```{r}
+#Main seurat object
+load("../data/processed_shyam/cluall_m5_0dpi_2dpi_dblt_filtd_rna_clustered_idented_peaks_recalled_genesLinked_chromvar_weighted_macs2peaks_embed_clustered_idented_cluster_formatted2.RData")
+seurat <- clu
+rm(clu)
+```
+
+```{r}
+DefaultAssay(seurat) <- "peaks"
+frags <- Fragments(seurat)  # get list of fragment objects
+frags[[1]] <- UpdatePath(frags[[1]], new.path = "../data/processed_shyam/multiome_support/C3_A11/outs/atac_fragments.tsv.gz")
+frags[[2]] <- UpdatePath(frags[[2]], new.path = "../data/processed_shyam/multiome_support/C1_A9/outs/atac_fragments.tsv.gz")
+Fragments(seurat) <- NULL  # remove fragment information from assay
+Fragments(seurat) <- frags  # assign update list of fragment objects back to the assay
+```
+
+# C-V pseudotime
+## Export EC differentiation as h5ad
+```{r}
+DimPlot(seurat, group.by="new_wnn_clusters", reduction='wnn.umap', label=T)
+```
+
+```{r}
+clusters_keep <- c("RevSC1-W13", "ICC-W8",
+                   grep("EC-", unique(seurat$new_wnn_clusters), value = T))
+seurat_ec <- subset(seurat, new_wnn_clusters %in% clusters_keep)
+```
+
+```{r}
+DimPlot(seurat_ec, group.by="new_wnn_clusters", reduction='wnn.umap', label=T)
+```
+
+```{r}
+df <- data.frame(UMAP1 = Embeddings(seurat, 'wnn.umap')[,1],
+                 UMAP2 = Embeddings(seurat, 'wnn.umap')[,2],
+                 Clusters = ifelse(seurat$new_wnn_clusters %in% clusters_keep,
+                                   "Keep", "Remove"))
+
+ec_plot <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+  geom_point(shape=16, size=1, aes(color=Clusters)) +
+  scale_color_manual(values=c('forestgreen', 'lightgrey')) +
+  theme_void() + theme(legend.position="none")
+ggsave(ec_plot,
+       filename="../figs/umap_cv_clusters_kept.pdf",
+       width=3, height=2.75)
+```
+
+## Note: EC-W2 and EC-W7 removed downstraem
+For zonation analysis, I will remove EC-W2 and EC-W7. I think they're biologically real, but they are essentially empty husks of a cell, with little RNA/feature content, leading to artifacts following normalization. Cells die off the villus tip and this could be related to that, but it's worth nothing that these are not healthy villus tip cells--expression of tip markers are represented in other populations.
+
+Of note, the ATAC profiles of these cells actually seems fine. Perhaps suggests some mechanism of transcriptional repression. They will be omitted from the zonation analysis
+
+```{r}
+seurat_ec$nCount_RNA_log2 <- log2(seurat_ec$nCount_RNA)
+VlnPlot(seurat_ec, features="nFeature_RNA", group.by="new_wnn_clusters")
+VlnPlot(seurat_ec, features="nCount_RNA_log2", group.by="new_wnn_clusters")
+VlnPlot(seurat_ec, features="Ada", group.by="new_wnn_clusters") 
+#Ada = tip marker. Yes, highest in W2, but that's inflated from normalization
+#EC W5 seems to be the healthy villus tip cells
+```
+
+```{r}
+seurat_ec <- subset(seurat_ec, new_wnn_clusters %nin% c("EC-W2", "EC-W7"))
+```
+
+
+## Save
+
+```{r}
+saveRDS(seurat_ec, file="../output/seurat_cv_zonation.rds")
+```
+
+```{r}
+library(sceasy)
+library(reticulate)
+tmp <- CreateSeuratObject(seurat_ec[["RNA"]]@counts,
+                          meta.data = seurat_ec@meta.data)
+
+use_condaenv(condaenv="r-reticulate",
+             conda="/Users/dpcook/Library/r-miniconda/bin/conda", 
+             required=T)
+sceasy::convertFormat(tmp, from="seurat", to="anndata",
+                      outFile='../output/cv_zonation.h5ad')
+```
+
+## Load integrated epi embedding from scVI
+```{r}
+umap <- read.csv("../output/integrated_embedding.csv", row.names=1)
+meta <- read.csv('../output/rna_metadata.csv', row.names=1)
+```
+
+```{r}
+table(colnames(seurat_ec) %in% rownames(meta))
+```
+
+2888 removed from the dying clusters, doublets, and colonic lineage
+
+```{r}
+cells_keep <- intersect(colnames(seurat_ec), rownames(meta))
+```
+
+```{r}
+seurat_ec <- subset(seurat_ec, cells=cells_keep)
+```
+
+```{r}
+seurat_ec$zonation_cluster <- meta$leiden[match(colnames(seurat_ec), rownames(meta))]
+Idents(seurat_ec) <- seurat_ec$zonation_cluster
+```
+
+```{r}
+umap <- as.matrix(umap)
+rownames(umap) <- rownames(meta)
+umap <- umap[colnames(seurat_ec),]
+umap[,1] <- umap[,1] * -1 #horizontal flip so CV axis goes left to right
+seurat_ec[['scVI']] <- CreateDimReducObject(embeddings = umap, key = "scVI_", assay = 'ATAC')
+```
+
+```{r}
+DimPlot(seurat_ec, label=T, group.by="zonation_cluster", reduction='scVI')
+```
+
+## Pseudotime with slingshot
+```{r}
+slingshot_res <- slingshot(umap, clusterLabels=seurat_ec$zonation_cluster, start.clus = 1,
+                           thresh=1)
+curve <- getCurves(slingshot_res)
+
+seurat_ec$zonation_pseudotime <- slingshot_res@assays@data@listData[["pseudotime"]]
+seurat_ec$zonation_pseudotime <- seurat_ec$zonation_pseudotime / max(seurat_ec$zonation_pseudotime) #scale 0-1
+```
+
+
+```{r}
+colors <- colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)
+plotcol <- colors[cut(seurat_ec$zonation_pseudotime, breaks=100)]
+plot(Embeddings(seurat_ec, 'scVI'), col = plotcol, pch=16, asp = 1)
+lines(SlingshotDataSet(curve), lwd = 3, col = 'black')
+```
+
+
+```{r}
+FeaturePlot(seurat_ec, features="zonation_pseudotime", reduction='scVI')
+```
+
+Group into bins
+```{r}
+seurat_ec$zonation_bin <- cut(seurat_ec$zonation_pseudotime, 
+                              breaks = c(-0.01, 0.2, 0.4,  
+                                         0.6, 0.8, 1),
+                              labels = paste0("Level", 1:5))
+
+seurat_ec$zonation_bin <- factor(seurat_ec$zonation_bin, 
+                                 levels=paste0("Level", 5:1))
+```
+
+```{r}
+zonation_cols <- rev(RColorBrewer::brewer.pal(6, 'Spectral'))[-3]
+```
+
+
+```{r}
+DimPlot(seurat_ec, group.by="zonation_bin", reduction='scVI') + NoAxis() +
+  scale_color_manual(values=zonation_cols)
+```
+
+## Proportion of WNN clusters per bin
+```{r}
+df <- seurat_ec@meta.data %>%
+  group_by(new_wnn_clusters,zonation_bin) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(prop = count / sum(count)) %>%
+  select(-count) %>%
+  pivot_wider(names_from=new_wnn_clusters, values_from="prop") %>%
+  column_to_rownames(var="zonation_bin") %>%
+  as.matrix()
+df[is.na(df)] <- 0
+```
+
+
+```{r}
+col_fun = colorRamp2(seq(0, 1, length.out=100), 
+                     viridis::mako(100))
+```
+
+```{r}
+pdf("../figs/zonation_wnn_cluster_proportions.pdf", width=3.75, height=2.4)
+col_dend = dendsort(hclust(dist(t(df)), method="ward.D2"), isReverse=T)
+Heatmap(df,
+        name="Proportion",
+        col = col_fun,
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 10)),
+        cluster_rows = F,
+        cluster_columns = col_dend,
+        show_row_dend = F,
+        show_column_dend = T,
+        column_dend_reorder = F,
+        #clustering_method_columns = "ward.D2",
+        row_dend_reorder = TRUE,
+        show_row_names = T,
+        show_column_names = T,
+        row_names_side = "left",
+        column_names_rot = 45,
+        #column_names_gp = gpar(fontsize = 10),
+        border = FALSE,
+        rect_gp = gpar(col = "black", lwd = 1),
+        width = ncol(df)*unit(5, "mm"), 
+        height = nrow(df)*unit(5, "mm"),
+        use_raster=F)
+dev.off()
+```
+
+# Save point
+## Fix Annotation and Motifs
+```{r}
+library(JASPAR2022)
+library(TFBSTools)
+library(BSgenome.Mmusculus.ensembl.mm39)
+```
+
+```{r}
+pfm <- getMatrixSet(
+  x = JASPAR2022,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# add motif information
+seurat_ec <- AddMotifs(
+  object = seurat_ec,
+  genome = BSgenome.Mmusculus.ensembl.mm39,
+  pfm = pfm
+)
+```
+
+```{r}
+annos <- Annotation(seurat_ec)
+annos$tx_id <- annos$transcript_id
+Annotation(seurat_ec) <- annos
+```
+
+
+```{r}
+saveRDS(seurat_ec, file="../output/seurat_cv_zonation.rds")
+```
+
+```{r}
+seurat_ec <- readRDS("../output/seurat_cv_zonation.rds")
+```
+
+```{r}
+library(BSgenome.Mmusculus.ensembl.mm39)
+seurat_ec <- RunChromVAR(
+  object = seurat_ec,
+  genome = BSgenome.Mmusculus.ensembl.mm39
+)
+DefaultAssay(seurat_ec) <- "chromvar"
+
+mat <- seurat_ec[['chromvar']]@data
+rownames(mat) <- make.unique(unlist(seurat_ec[['peaks']]@motifs@motif.names))
+chromvar_new <- CreateAssayObject(counts = mat)
+seurat_ec[['chromvar']] <- chromvar_new
+```
+
+
+# Zonation scoring
+```{r}
+seurat_ec_0dpi <- subset(seurat_ec, time=="0dpi")
+zonation_markers <- read.csv("~/Data/GeneLists/Villus_Zonation_Moor.csv", header=T)
+zonation_markers <- list(Level1 = zonation_markers$Cluster.1[zonation_markers$Cluster.1 != ""],
+                         Level2 = zonation_markers$Cluster.2[zonation_markers$Cluster.2 != ""],
+                         Level3 = zonation_markers$Cluster.3[zonation_markers$Cluster.3 != ""],
+                         Level4 = zonation_markers$Cluster.4[zonation_markers$Cluster.4 != ""],
+                         Level5 = zonation_markers$Cluster.5[zonation_markers$Cluster.5 != ""])
+DefaultAssay(seurat_ec_0dpi) <- "RNA"
+seurat_ec_0dpi <- AddModuleScore(seurat_ec_0dpi, features=zonation_markers)
+```
+
+```{r}
+FeaturePlot(seurat_ec, features=c("Cluster1", "Cluster2", "Cluster3", "Cluster4", "Cluster5"),
+            reduction='scVI')
+VlnPlot(seurat_ec, features=c("Cluster1", "Cluster2", "Cluster3", "Cluster4", "Cluster5"),
+            group.by="zonation_bin", pt.size=0)
+```
+
+```{r}
+plotScore <- function(cluster){
+  df <- data.frame(Region = seurat_ec_0dpi$zonation_bin,
+                   Expression = seurat_ec_0dpi@meta.data[,cluster])
+  df$Region <-  factor(df$Region, levels=paste0("Level",1:5)) 
+  exp_plot <- ggplot(df, aes(x=Region, y=Expression)) +
+    geom_violin(color="black", aes(fill=Region)) +
+    geom_boxplot(width=0.25, outlier.size=0, color="black", fill="lightgrey", alpha=0.5) +
+    scale_fill_manual(values=rev(zonation_cols)) +
+    xlab("") + ylab("Signature score") + ggtitle(cluster) +
+    theme_classic() +
+    theme(axis.text.x=element_text(angle=45, hjust=1, color="black", size=12),
+          axis.text.y=element_text(size=10, color= "black"),
+          axis.title = element_text(size=12),
+          legend.position="none")
+  exp_plot
+}
+
+p1 <- plotScore("Cluster1")
+p2 <- plotScore("Cluster2")
+p3 <- plotScore("Cluster3")
+p4 <- plotScore("Cluster4")
+p5 <- plotScore("Cluster5")
+
+cluster_plot <- cowplot::plot_grid(p1, p2, p3, p4, p5, align="vh",
+                                   ncol = 3)
+cowplot::save_plot(cluster_plot,
+                   filename="../figs/Moor_Signature_Expression.pdf",
+                   base_width=5.75, base_height=4.25)
+```
+
+# nFeature per region
+```{r}
+df <- seurat_ec_0dpi@meta.data
+df$zonation_bin <-  factor(df$zonation_bin, levels=paste0("Level",1:5)) 
+
+peak_plot <- ggplot(df, 
+                    aes(x=zonation_bin, y=log10(nFeature_ATAC))) +
+    geom_violin(color="black", aes(fill=zonation_bin)) +
+    geom_boxplot(width=0.25, outlier.size=0, color="black", fill="lightgrey", alpha=0.5) +
+    scale_fill_manual(values=rev(zonation_cols)) +
+    xlab("") + ylab("Number of regions\n(log10)") + ggtitle("Accessible regions") +
+    theme_classic() +
+    theme(axis.text.x=element_text(angle=45, hjust=1, color="black", size=12),
+          axis.text.y=element_text(size=10, color= "black"),
+          axis.title = element_text(size=12),
+          legend.position="none")
+ggsave(peak_plot, filename="../figs/atac_region_count_0dpi.pdf",
+       width=3, height=2.5)
+```
+
+
+# DGE - Zonation pseudotime
+```{r}
+DefaultAssay(seurat_ec) <- "RNA"
+seurat_ec_0dpi <- subset(seurat_ec, time=="0dpi")
+seurat_ec_0dpi <- CreateSeuratObject(counts = seurat_ec_0dpi[['RNA']]@counts,
+                                     meta.data = seurat_ec_0dpi@meta.data,
+                                     min.cells = ncol(seurat_ec_0dpi)*0.01)
+seurat_ec_0dpi <- FindVariableFeatures(seurat_ec_0dpi, nfeatures = 2000)
+slingshot_res_0dpi <- slingshot_res[seurat_ec$time == "0dpi",]
+
+set.seed(123)
+pseudo_res <- fitGAM(counts = seurat_ec_0dpi[["RNA"]]@counts[VariableFeatures(seurat_ec_0dpi),], 
+                     pseudotime = seurat_ec_0dpi$zonation_pseudotime,
+                     cellWeights = slingshot_res_0dpi@assays@data@listData$weights, 
+                     nknots=6, verbose=T)
+
+assocRes <- associationTest(pseudo_res)
+assocRes <- na.omit(assocRes)
+assocRes$padj <- p.adjust(assocRes$pvalue, method="BH")
+startRes <- startVsEndTest(pseudo_res)
+```
+
+```{r}
+sig_genes <- rownames(assocRes)[assocRes$padj < 0.05 & assocRes$meanLogFC > 0.5]
+```
+
+```{r}
+### based on mean smoother
+smoothed_exp <- predictSmooth(pseudo_res, gene = sig_genes, nPoints = 100, tidy = FALSE)
+smoothed_exp <- t(scale(t(smoothed_exp)))
+```
+
+```{r}
+max_exp_position <- max.col(smoothed_exp, ties.method="first")
+smoothed_exp <- smoothed_exp[rev(order(max_exp_position)),]
+```
+
+## Not clustered
+```{r}
+genes_to_annotate <- c("Lgr5", "Olfm4", "Mki67", "Reg1", "Reg3a", "Slc2a2", 
+                       "Apob", "Pigr", "Slc5a1", "Slc28a2", "Nt5e")
+gene_annotation <- rowAnnotation(foo = anno_mark(at = match(genes_to_annotate, rownames(smoothed_exp)),
+                                         labels = genes_to_annotate))
+```
+
+
+```{r}
+col_fun = colorRamp2(seq(-2, 2, length.out=100), 
+                     viridis::magma(100))
+```
+
+```{r}
+pdf("../figs/zonation_sig_expression.pdf", width=2.5,  height=3.2)
+#row_dend = dendsort(hclust(dist(smoothed_exp), method="ward.D2"), isReverse=T)
+ht <- Heatmap(smoothed_exp,
+        name="Relative\nexpression",
+        col = col_fun,
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 10),
+                                    direction = "horizontal",
+                                    title="Relative expression"),
+        cluster_rows = F,
+        row_split=5,
+        cluster_columns = F,
+        show_row_names = F,
+        show_column_names = F,
+        right_annotation = gene_annotation,
+        border = TRUE,
+        use_raster=T)
+draw(ht, heatmap_legend_side = "bottom")
+dev.off()
+```
+
+## Clustered
+```{r}
+genes_to_annotate <- c("Lgr5", "Olfm4", "Mki67", "Reg1", "Reg3a", "Slc2a2", 
+                       "Apob", "Pigr", "Slc5a1", "Slc28a2", "Nt5e")
+gene_annotation <- rowAnnotation(foo = anno_mark(at = match(genes_to_annotate, rownames(smoothed_exp)),
+                                         labels = genes_to_annotate))
+```
+
+```{r}
+col_fun = colorRamp2(seq(-2, 2, length.out=100), 
+                     viridis::magma(100))
+```
+
+```{r}
+pdf("../figs/zonation_sig_expression_clustered.pdf", width=3.5,  height=3.2)
+#row_dend = dendsort(hclust(dist(smoothed_exp), method="ward.D2"), isReverse=T)
+ht <- Heatmap(smoothed_exp,
+        col = col_fun,
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 10),
+                                    title="Relative expression"),
+        cluster_rows = T,
+        row_split=5,
+        cluster_columns = F,
+        clustering_method_columns = "ward.D2",
+        show_row_names = F,
+        show_row_dend = F,
+        show_column_names = F,
+        right_annotation = gene_annotation,
+        border = TRUE,
+        use_raster=T)
+draw(ht, heatmap_legend_side = "right")
+dev.off()
+clusters <- row_order(ht)
+for(i in 1:length(clusters)){
+  clusters[[i]] <- rownames(smoothed_exp)[clusters[[i]]]
+}
+```
+
+
+
+# Zonation - ATAC activity
+```{r}
+DefaultAssay(seurat_ec) <- "peaks"
+seurat_ec_0dpi <- subset(seurat_ec, time=="0dpi")
+gene_activity <- GeneActivity(seurat_ec_0dpi, features=sig_genes,
+                               extend.upstream = 20000, extend.downstream = 20000)
+
+
+seurat_ec_0dpi[['Activity']] <- CreateAssayObject(counts = gene_activity)
+seurat_ec_0dpi <- NormalizeData(
+  object = seurat_ec_0dpi,
+  assay = 'Activity',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(seurat_ec_0dpi$nCount_Activity)
+)
+```
+
+## Get smoothed matrix
+```{r}
+exp <- as.matrix(seurat_ec_0dpi[["Activity"]]@data)
+exp <- t(scale(t(exp), scale=T, center=T))
+fits <- apply(exp, 1, function(z){
+  pseudo_data <- data.frame(Exp=z,
+                            Pseudotime=seurat_ec_0dpi$zonation_pseudotime)
+    model <- mgcv::gam(Exp ~ s(Pseudotime, k=4), 
+                       data=pseudo_data, #Manually checked overfitting
+                       method="REML")
+    target_values <- data.frame(Pseudotime = seq(0, 1, length.out=100))
+    new_pseudo_values <- predict(model, newdata=target_values)
+})
+fits <- t(fits)
+```
+
+45 genes not calcualted for gene activity.
+```{r}
+gene_order <- rownames(smoothed_exp)[!rownames(smoothed_exp) %nin% rownames(fits)]
+```
+
+
+```{r}
+fits <- fits[gene_order,] #order same as GEX
+```
+
+```{r}
+col_fun = colorRamp2(seq(-0.25, 0.25, length.out=100), 
+                     viridis::mako(100))
+```
+
+```{r}
+pdf("../figs/zonation_sig_accessibility.pdf", width=1.9,  height=3.2)
+#row_dend = dendsort(hclust(dist(smoothed_exp), method="ward.D2"), isReverse=T)
+ht <- Heatmap(fits,
+        name="Chromatin accessibility",
+        col = col_fun,
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 10),
+                                    direction = "horizontal"),
+        cluster_rows = F,
+        cluster_columns = F,
+        row_dend_reorder = TRUE,
+        show_row_names = F,
+        show_column_names = F,
+        border = TRUE,
+        use_raster=T)
+draw(ht, heatmap_legend_side = "bottom")
+dev.off()
+```
+
+# TSS Enrichment at zonation
+
+```{r}
+anno <- seurat_ec[["peaks"]]@annotation
+zonation_genes <- anno[anno$type == "gene" & 
+                      anno$gene_name %in% clusters[[5]],]
+zonation_genes <- GetTSSPositions(zonation_genes)
+tmp <- subset(seurat_ec, time=='0dpi')
+DefaultAssay(tmp) <- "peaks"
+tmp <- TSSEnrichment(tmp, tss.positions=zonation_genes, verbose=F, fast=F) 
+#verbose has to be false to avoid error in progress bar??
+tss_plot <- TSSPlot(tmp, group.by = 'zonation_bin') + 
+  ggtitle("TSS enrichment - Cluster 5 genes") +
+  NoLegend()
+ggsave(tss_plot, filename="../figs/atac_tss_enrichment_zonation_cluster5.pdf",
+       width=6, height=3.75)
+```
+
+# Zonation - DA
+If TSSs are relatively static, what is specifically changing??
+
+```{r}
+seurat_ec_0dpi <- subset(seurat_ec, time=='0dpi')
+Idents(seurat_ec_0dpi) <- seurat_ec_0dpi$zonation_bin
+DefaultAssay(seurat_ec_0dpi) <- 'peaks'
+seurat_ec_0dpi$atac_raw_reads_log10 <- log10(seurat_ec_0dpi$atac_raw_reads)
+
+da_zonation <- FindAllMarkers(
+  seurat_ec_0dpi,
+  test.use="LR",
+  latent.vars = "atac_raw_reads_log10",
+  min.pct=0.01, logfc.threshold = 0.5,
+  only.pos=T
+)
+
+closest_feature <- ClosestFeature(seurat_ec_0dpi, regions = da_zonation$gene)
+da_zonation$closest_gene <- closest_feature$gene_name
+da_zonation$closest_feature_type <- closest_feature$type
+da_zonation$closest_feature_distance <- closest_feature$distance
+
+
+motif_level1 <- FindMotifs(seurat_ec_0dpi, 
+                           da_zonation %>%
+                             filter(p_val_adj < 0.05 &
+                                      cluster=="Level1") %>%
+                             pull(gene))
+
+motif_level2 <- FindMotifs(seurat_ec_0dpi, 
+                           da_zonation %>%
+                             filter(p_val_adj < 0.05 &
+                                      cluster=="Level2") %>%
+                             pull(gene))
+motif_level3 <- FindMotifs(seurat_ec_0dpi, 
+                           da_zonation %>%
+                             filter(p_val_adj < 0.05 &
+                                      cluster=="Level3") %>%
+                             pull(gene))
+motif_level4 <- FindMotifs(seurat_ec_0dpi, 
+                           da_zonation %>%
+                             filter(p_val_adj < 0.05 &
+                                      cluster=="Level4") %>%
+                             pull(gene))
+motif_level5 <- FindMotifs(seurat_ec_0dpi, 
+                           da_zonation %>%
+                             filter(p_val_adj < 0.05 &
+                                      cluster=="Level5") %>%
+                             pull(gene))
+
+
+
+
+motif_level1$Region <- "Level 1"
+motif_level2$Region <- "Level 2"
+motif_level3$Region <- "Level 3"
+motif_level4$Region <- "Level 4"
+motif_level5$Region <- "Level 5"
+
+
+motif_enrichment_zonation <- bind_rows(motif_level1, motif_level2,
+                              motif_level3, motif_level4, motif_level5)
+
+write.csv(da_zonation, file="../output/da_zonation_peaks.csv", 
+          row.names = F)
+write.csv(motif_enrichment_zonation, file="../output/da_zonation_motifs.csv", 
+          row.names = F)
+```
+
+## Crypt vs. villus
+```{r}
+da_crypt_vs_villus <- FindMarkers(
+  seurat_ec_0dpi,
+  test.use="LR", ident.1=c("Level1"),
+  latent.vars = "atac_raw_reads_log10",
+  min.pct=0.01, logfc.threshold = 0.5,
+  only.pos=F
+)
+
+tf_crypt <- FindMotifs(seurat_ec_0dpi,
+                       rownames(da_crypt_vs_villus)[da_crypt_vs_villus$p_val_adj < 0.05 &
+                                                      da_crypt_vs_villus$avg_log2FC > 0])
+
+tf_villus <- FindMotifs(seurat_ec_0dpi,
+                       rownames(da_crypt_vs_villus)[da_crypt_vs_villus$p_val_adj < 0.05 &
+                                                      da_crypt_vs_villus$avg_log2FC < 0])
+```
+
+
+## Plot
+```{r}
+da_counts <- data.frame(Level = paste0("Level", 1:5),
+                        Peaks = c(1114, 94, 6, 5, 116))
+
+da_plot <- ggplot(da_counts, aes(x=Peaks, y=Level)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", aes(fill=Peaks)) +
+  scale_fill_gradientn(colours=RColorBrewer::brewer.pal(9, "GnBu")) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(da_counts$Peaks+75))) +
+ xlab("Number of uniquely accessible peaks") + ylab("") + 
+  ggtitle("Regional chromatin accessibility") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none",
+        plot.margin = margin(10, 25, 10, 10))
+
+ggsave(da_plot, filename="../figs/da_peak_count_zonation.pdf",
+       width=3.65, height=2.35) 
+```
+
+# chromvar - pseudotime
+```{r}
+exp <- as.matrix(seurat_ec_0dpi[["chromvar"]]@data)
+  
+gam.pval <- apply(exp,1,function(z){
+    d <- data.frame(exp=z, pseudotime=seurat_ec_0dpi$zonation_pseudotime)
+    tmp <- mgcv::gam(exp ~ s(pseudotime, k=4), 
+                     data=d,
+                     method="REML")
+    p <- summary(tmp)[[8]] # where the p-value is stored
+    p
+    })
+gam.pval <- as.data.frame(gam.pval)
+colnames(gam.pval) <- "pval"
+gam.pval$Gene <- rownames(gam.pval)
+gam.pval$padj <- p.adjust(gam.pval$pval, method='fdr')
+```
+
+```{r}
+motifs_plot <-  c("FOS::JUN", "KLF5", "SNAI1", "Rxra", "TCF4",
+                  "ASCL1", "NFIB", "ZEB1", "MAFK", "HNF4A", "NR2F6")
+
+mat <- seurat_ec_0dpi[['chromvar']]@data[motifs_plot,]
+#mat[mat > 3] <- 3
+#mat[mat < -3] <- -3
+mat <- scale(t(mat))
+df <- data.frame(Region = seurat_ec_0dpi$zonation_bin)
+df <- df %>%
+  bind_cols(as.data.frame(mat)) %>%
+  pivot_longer(-Region, names_to="TF", values_to="Activity") %>%
+  group_by(Region, TF) %>%
+  dplyr::summarize(Activity = mean(Activity)) %>%
+  pivot_wider(names_from="TF", values_from="Activity") %>%
+  column_to_rownames(var="Region") %>%
+  as.matrix()
+
+df <- t(df)
+df <- df[,paste0("Level",1:5)]
+```
+
+```{r}
+col_fun = colorRamp2(seq(-1, 1, length.out=100), 
+                     colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))(100))
+```
+
+```{r}
+pdf("../figs/zonation_tf_activity.pdf", width=3, height=3)
+Heatmap(df,
+        name="ChromVAR",
+        col = col_fun,
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 10)),
+        cluster_rows = T,
+        cluster_columns = F,
+        show_row_dend = F,
+        clustering_method_rows = "ward.D2",
+        show_row_names = T,
+        show_column_names = T,
+        row_names_side = "left",
+        column_names_rot = 45,
+        #column_names_gp = gpar(fontsize = 10),
+        border = FALSE,
+        rect_gp = gpar(col = "black", lwd = 1),
+        width = ncol(df)*unit(5, "mm"), 
+        height = nrow(df)*unit(5, "mm"),
+        use_raster=F)
+dev.off()
+```
+
+
+
+```{r}
+top_tfs <- motif_enrichment_zonation %>%
+  filter(p.adjust < 0.05) %>%
+  group_by(Region) %>%
+  arrange(p.adjust) %>%
+  top_n(-5, p.adjust) %>%
+  pull(motif.name)
+
+motif_mat <- motif_enrichment_zonation %>%
+  mutate(motif = paste0(motif_enrichment_zonation$motif.name, "-", motif_enrichment_zonation$motif)) %>%
+  filter(motif.name %in% top_tfs) %>%
+  select(p.adjust, motif, Region) %>%
+  pivot_wider(names_from="motif", values_from="p.adjust") %>%
+  column_to_rownames(var="Region") %>%
+  as.matrix()
+motif_mat <- -log10(motif_mat)
+```
+
+
+```{r}
+col_fun = colorRamp2(seq(0, 15, length.out=100), 
+                     colorRampPalette(RColorBrewer::brewer.pal(9, "Greys"))(100))
+```
+
+```{r}
+pdf("../figs/zonation_peaks_top_tfs.pdf", width=6, height=4)
+Heatmap(motif_mat,
+        name="-log10(padj)",
+        col = col_fun,
+        na_col = "grey95",
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 10)),
+        cluster_rows = F,
+        cluster_columns = T,
+        show_row_dend = F,
+        show_column_dend = F,
+        clustering_method_rows = "ward.D2",
+        show_row_names = T,
+        show_column_names = T,
+        row_names_side = "left",
+        column_names_rot = 45,
+        #column_names_gp = gpar(fontsize = 10),
+        border = FALSE,
+        rect_gp = gpar(col = "black", lwd = 1),
+        width = ncol(motif_mat)*unit(5, "mm"), 
+        height = nrow(motif_mat)*unit(5, "mm"),
+        use_raster=F)
+dev.off()
+```
+
+# Test - Crypt vs villus
+Not getting many differnetial peaks in mid levels, probably beacuse levels 3,4, and 5 have similar profiles. 
+
+```{r}
+da_crypt_vs_villus <- FindMarkers(
+  seurat_ec_0dpi,
+  ident.1=c("Level1", "Level2"),
+  ident.2=c("Level3", "Level4", "Level5"),
+  test.use="LR",
+  latent.vars = "atac_raw_reads_log10",
+  min.pct=0.01, logfc.threshold = 1, #increasing logFC threshold
+  only.pos=F
+)
+
+closest_feature <- ClosestFeature(seurat_ec_0dpi, regions = rownames(da_crypt_vs_villus))
+da_crypt_vs_villus$closest_gene <- closest_feature$gene_name
+da_crypt_vs_villus$closest_feature_type <- closest_feature$type
+da_crypt_vs_villus$closest_feature_distance <- closest_feature$distance
+
+
+motif_crypt <- FindMotifs(seurat_ec_0dpi, 
+                          rownames(da_crypt_vs_villus)[da_crypt_vs_villus$p_val_adj < 0.05 &
+                                                         da_crypt_vs_villus$avg_log2FC > 0])
+
+motif_villus <- FindMotifs(seurat_ec_0dpi, 
+                          rownames(da_crypt_vs_villus)[da_crypt_vs_villus$p_val_adj < 0.05 &
+                                                         da_crypt_vs_villus$avg_log2FC < 0])
+```
+
+
+# Zonation - Coverage plots
+```{r}
+seurat_ec_0dpi <- subset(seurat_ec, time=="0dpi")
+DefaultAssay(seurat_ec_0dpi) <- 'peaks'
+```
+
+
+## Olfm4 - Crypt
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Olfm4", extend.upstream = 13000, extend.downstream = -5000,
+  group.by="zonation_bin",
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Olfm4_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Lgr5 - Crypt
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Lgr5", extend.upstream = -50000, extend.downstream = 1000,
+  group.by="zonation_bin",
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Lgr5_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Reg1 - CVJ
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Reg1", extend.upstream = 500, extend.downstream = 5000,
+  group.by="zonation_bin",
+  ymax = 15
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Reg1_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Reg3a - CVJ/early villus
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Reg3a", extend.upstream = 2000, extend.downstream = 2000,
+  group.by="zonation_bin",
+  ymax = 15
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Reg3a_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Slc5a1 - Villus
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Slc5a1", extend.upstream = 20000, extend.downstream = -45000,
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Slc5a1_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Ada - Villus tip
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Ada", extend.upstream = -20000, extend.downstream = 15000,
+  group.by="zonation_bin",
+  ymax = 30
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Ada_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Slc28a2 - Villus tip
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Slc28a2", extend.upstream = 500, extend.downstream = 10000,
+  group.by="zonation_bin",
+  ymax = 30
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Slc28a2_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Tfrc - Crypt (Supp)
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Tfrc", extend.upstream = 2000, extend.downstream = -20000,
+  group.by="zonation_bin",
+  ymax = 100
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Tfrc_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Slc2a2 - Mid-late villus (Supp)
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Slc2a2", extend.upstream = 1000, extend.downstream = 10000,
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Slc2a2_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+## Slc15a1 - Late villus (Supp)
+
+```{r}
+p1 <- CoveragePlot(
+  seurat_ec_0dpi,
+  region="Slc15a1", extend.upstream = -2500, extend.downstream = 8000,
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+ggsave(p1, filename = "../figs/CoveragePlots/Slc15a1_0dpi_only.pdf",
+       width=2.2, height=3)
+```
+
+# Zonation - Pseudotime exp
+```{r}
+plotExpression <- function(gene){
+  df <- data.frame(Pseudotime = seurat_ec_0dpi$zonation_pseudotime,
+                   Expression = seurat_ec_0dpi[["RNA"]]@data[gene,],
+                   #Expression = log1p(seurat_ec_0dpi[["RNA"]]@counts[gene,]),
+                   zonation_bin = seurat_ec_0dpi$zonation_bin)
+  
+  df <- filter(df, Expression != 0)
+  pseudo_plot <- ggplot(df, aes(x=Expression, y=Pseudotime)) +
+    geom_point(shape=16, size=1, aes(color=zonation_bin)) +
+    geom_smooth(color="black", size=0.5, orientation = "y") +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_x_continuous(expand=c(0,0)) +
+    scale_color_manual(values=zonation_cols) + 
+    ylab("") + xlab("Expression\nlog(CP10k+1)") + ggtitle(gene) +
+    theme_bw() +
+    theme(legend.position="none",
+          axis.text.y = element_blank(),
+          axis.text.x = element_text(size=10, color='black'),
+          axis.title = element_text(size=10),
+          axis.ticks.y = element_blank())
+  ggsave(pseudo_plot, filename = paste0("../figs/expression_pseudotime_", gene, ".pdf"),
+         width=1.3, height=3)
+  pseudo_plot
+}
+```
+
+```{r}
+plotExpression("Olfm4")
+plotExpression("Lgr5") #ran this without smooth line
+plotExpression("Mki67")
+plotExpression("Reg1")
+plotExpression("Reg3a")
+plotExpression("Slc5a1")
+plotExpression("Ada")
+plotExpression("Slc28a2")
+plotExpression("Tfrc")
+plotExpression("Slc2a2")
+plotExpression("Slc15a1")
+```
+
+# Sample plots
+## Zonation UMAP
+```{r}
+df <- data.frame(UMAP1 = Embeddings(seurat_ec, 'scVI')[,1],
+                 UMAP2 = Embeddings(seurat_ec, 'scVI')[,2],
+                 zonation_pseudotime = seurat_ec$zonation_pseudotime,
+                 zonation_bin = seurat_ec$zonation_bin)
+```
+
+```{r}
+zon_umap <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+  geom_point(shape=16, size=1, aes(color=zonation_pseudotime)) +
+  ggtitle("Crypt-villus zonation") +
+  scale_color_gradientn(colours =rev(zonation_cols), 
+                        name="Pseudotime",
+                        guide = guide_colorbar(ticks.colour = "black",
+                                               frame.colour = "black",
+                                               barwidth=0.75)) +
+  theme_void()
+ggsave(zon_umap, filename="../figs/zonation_umap.pdf",
+       width=3.75, height=2.75)
+```
+
+## Binned
+
+```{r}
+zon_umap <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+  geom_point(shape=16, size=1, aes(color=zonation_bin)) +
+  ggtitle("Crypt-villus zonation (binned)") +
+  scale_color_manual(values=zonation_cols, 
+                        name="") +
+  theme_void() +
+  theme(legend.text=element_text(size=10))
+ggsave(zon_umap, filename="../figs/zonation_umap_binned.pdf",
+       width=3.75, height=2.75)
+```
+
+## Expression
+```{r}
+plotExpression <- function(gene){
+  df <- data.frame(UMAP1 = Embeddings(seurat_ec, 'scVI')[,1],
+                 UMAP2 = Embeddings(seurat_ec, 'scVI')[,2],
+                 zonation_pseudotime = seurat_ec$zonation_pseudotime,
+                 Expression = seurat_ec[["RNA"]]@data[gene,])
+  df <- df[order(df$Expression),]
+  
+  exp_plot <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+    geom_point(shape=16, size=1, aes(color=Expression)) +
+    ggtitle(gene) +
+    scale_color_gradientn(colours = c("grey90", rev(viridis::magma(100))), 
+                          breaks=c(0, max(df$Expression)),
+                          labels=c("Min", "Max"),
+                          name="Expression",
+                          guide = guide_colorbar(ticks.colour = "black",
+                                               frame.colour = "black",
+                                               barwidth=0.75, barheight = 3)) +
+    theme_void()
+  return(exp_plot)
+}
+```
+
+```{r}
+p1 <- plotExpression("Lgr5") + theme(legend.position="none")
+p2 <- plotExpression("Tfrc") + theme(legend.position="none") #Cluster1
+p3 <- plotExpression("Reg1") + theme(legend.position="none") #Cluster2
+p4 <- plotExpression("Slc2a2") + theme(legend.position="none") #cluster 3
+p5 <- plotExpression("Slc15a1") + theme(legend.position="none") #Cluster 4
+p6 <- plotExpression("Ada") + theme(legend.position="none") #cluster 5
+
+ggsave(plotExpression("Mki67"), filename="../figs/zonation_Mki67.pdf",
+       width=3, height=2.25)
+
+# Plot
+all_genes <- cowplot::plot_grid(p1, p2, p3, p4, p5, p6,
+                   ncol=3)
+
+#Add legend
+legend <- cowplot::get_legend(plotExpression("Lgr5") + theme(legend.box.margin=margin(0,10,0,10)))
+full_grid <- cowplot::plot_grid(all_genes, legend, rel_widths=c(1, 0.2),
+                                 align="h", axis="t")
+cowplot::save_plot(full_grid, filename="../figs/zonation_markers.pdf",
+                   base_width=5.25, base_height=3.25)
+```
+
+
+## Sample distribution
+
+```{r}
+dpi_cols <- RColorBrewer::brewer.pal(9, "RdBu")
+```
+
+
+```{r}
+library(ggridges)
+density_plot <- ggplot(seurat_ec@meta.data, aes(x=zonation_pseudotime, y=time)) +
+  geom_density_ridges(aes(fill = time), alpha=0.5, scale = 3, rel_min_height = 0.01) +
+  ylab("") + xlab("Pseudotime (zonation)") + 
+  scale_x_continuous(breaks=c(0, 0.2, 0.4, 0.6, 0.8, 1)) +
+  scale_fill_manual(values=c(dpi_cols[9], dpi_cols[1])) +
+  theme_ridges() + theme(legend.position='none') 
+
+ggsave(density_plot, filename="../figs/zonation_density.pdf",
+       width=3.25, height=1.75)
+```
+
+```{r}
+df_bg <- data.frame(UMAP1 = Embeddings(seurat_ec, 'scVI')[,1],
+                 UMAP2 = Embeddings(seurat_ec, 'scVI')[,2],
+                 Sample = seurat_ec$time)
+df_sample <- df_bg %>% filter(Sample == "0dpi")
+
+p1 <- ggplot(df_bg, aes(x=UMAP1, y=UMAP2)) +
+  geom_point(shape=16, size=2, color='grey90') +
+  geom_point(shape=16, size=0.5, color=dpi_cols[9], data=df_sample) +
+  ggtitle("0dpi") +
+  theme_void()
+
+df_sample <- df_bg %>% filter(Sample == "2dpi")
+p2 <- ggplot(df_bg, aes(x=UMAP1, y=UMAP2)) +
+  geom_point(shape=16, size=2, color='grey90') +
+  geom_point(shape=16, size=0.5, color=dpi_cols[1], data=df_sample) +
+  ggtitle("2dpi") +
+  theme_void()
+
+sample_plot <- cowplot::plot_grid(p1, p2, ncol = 1)
+cowplot::save_plot(sample_plot, filename="../figs/zonation_sample_distribution_umap.pdf",
+                   base_width = 2.2, base_height=4)
+```
+
+# Expression - RevSC
+```{r}
+plotExpression <- function(gene){
+  df <- data.frame(UMAP1 = Embeddings(seurat_ec, 'scVI')[,1],
+                 UMAP2 = Embeddings(seurat_ec, 'scVI')[,2],
+                 time = seurat_ec$time,
+                 Expression = seurat_ec[["RNA"]]@data[gene,])
+  df_0dpi <- df %>% filter(time == '0dpi')
+  df_2dpi <- df %>% filter(time == '2dpi')
+  
+  
+  df_2dpi <- df_2dpi[order(df_2dpi$Expression),]
+  
+  exp_plot <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+    geom_point(shape=16, size=1, color='grey90', data=df_0dpi) + 
+    geom_point(shape=16, size=1, aes(color=Expression), data=df_2dpi) +
+    ggtitle(gene) +
+    scale_color_gradientn(colours = c("grey90", rev(viridis::magma(100))), 
+                          breaks=c(0, max(df_2dpi$Expression)),
+                          labels=c("Min", "Max"),
+                          name="Expression",
+                          guide = guide_colorbar(ticks.colour = "black",
+                                               frame.colour = "black",
+                                               barwidth=0.75, barheight = 3)) +
+    theme_void()
+  return(exp_plot)
+}
+```
+
+```{r}
+p1 <- plotExpression("Clu") + theme(legend.position="none")
+p2 <- plotExpression("Cd44") + theme(legend.position="none")
+p3 <- plotExpression("Ly6a") + theme(legend.position="none")
+p4 <- plotExpression("Anxa3") + theme(legend.position="none")
+
+# Plot
+all_genes <- cowplot::plot_grid(p1, p2, p3, p4, 
+                   ncol=2)
+
+#Add legend
+legend <- cowplot::get_legend(plotExpression("Lgr5") + theme(legend.box.margin=margin(0,10,0,10)))
+full_grid <- cowplot::plot_grid(all_genes, legend, rel_widths=c(1, 0.2),
+                                 align="h", axis="t")
+cowplot::save_plot(full_grid, filename="../figs/revsc_markers_2dpi.pdf",
+                   base_width=4.5, base_height=3.75)
+```
+
+# Regional DGE
+```{r}
+DefaultAssay(seurat_ec) <- "RNA"
+Idents(seurat_ec) <-seurat_ec$zonation_bin
+
+runDGE <- function(region){
+  print(paste0("Running DGE on: ", region))
+  dge <- FindMarkers(seurat_ec,
+                     ident.1="2dpi",
+                     group.by="time", subset.ident=region,
+                     only.pos=F, min.pct = 0.1, logfc.threshold = 0.1)
+  dge$zonation_bin = region
+  dge$Gene <- rownames(dge)
+  
+  print(paste0("Number of DEGs: ",
+               nrow(dge %>%
+                      filter(p_val_adj < 0.1 & avg_log2FC > 0.1))))
+  return(dge)
+}
+
+all_levels <- paste0("Level", 1:5)
+dge_regional <- lapply(all_levels, runDGE)
+
+dge_regional <- do.call("rbind", dge_regional)
+
+write.csv(dge_regional, file="../output/dge_zonation_regional.csv", row.names=F)
+```
+
+## DEG count
+```{r}
+count_list <- c()
+for(i in 1:5){
+  count <- dge_regional %>%
+    filter(zonation_bin == paste0("Level", i) &
+             p_val_adj < 0.05 & 
+             avg_log2FC > 0.1) %>%
+    nrow()
+  count_list <- c(count_list, count)
+}
+
+count_res <- data.frame(Region = paste0("Level ", 1:5),
+                         DEG_Count = count_list)
+
+count_plot <- ggplot(count_res, aes(x=DEG_Count, y=Region)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", aes(fill=DEG_Count)) +
+  scale_fill_gradientn(colours=RColorBrewer::brewer.pal(9, "GnBu")) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(count_res$DEG_Count+50))) +
+  xlab("Number of upregulated\n genes") + ylab("") + 
+  ggtitle("Regional differential expression\n(2dpi vs. 0dpi)") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none",
+        plot.margin = margin(10, 25, 10, 10))
+
+ggsave(count_plot, filename="../figs/dge_deg_count.pdf",
+       width=3.65, height=2.355)  
+```
+
+
+## RevSC enrichment
+```{r}
+revsc_sig <- readLines("~/Data/GeneLists/revSC_top50.txt")
+```
+
+```{r}
+go_object <- newGeneOverlap(dge_regional %>%
+                                filter(zonation_bin == "Level1"&
+                                         p_val_adj < 0.05 & 
+                                         avg_log2FC > 0.1) %>%
+                                pull(Gene), 
+                            revsc_sig,
+                            spec = "hg19.gene")
+go_object <- testGeneOverlap(go_object)
+go_object
+```
+
+### Plot revSC enrichment in each level
+```{r}
+pvals <- c()
+for(i in 1:5){
+  go_object <- newGeneOverlap(dge_regional %>%
+                                filter(zonation_bin == paste0("Level", i) &
+                                         p_val_adj < 0.05 & 
+                                         avg_log2FC > 0.1) %>%
+                                pull(Gene), 
+                            revsc_sig,
+                            spec = "hg19.gene")
+  go_object <- testGeneOverlap(go_object)
+  pvals <- c(pvals, go_object@pval)
+}
+
+enrich_res <- data.frame(Region = paste0("Level ", 1:5),
+                         pval = -log10(pvals))
+
+enrich_plot <- ggplot(enrich_res, aes(x=pval, y=Region)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", aes(fill=pval)) +
+  geom_vline(xintercept = -log10(0.05), linetype=2, linewidth=1) +
+  scale_fill_gradientn(colours=RColorBrewer::brewer.pal(9, "Reds")) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(enrich_res$pval+0.5))) +
+  xlab("-log10(padj)") + ylab("") + 
+  ggtitle("RevSC signature enrichment\n(2dpi vs 0dpi)") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none",
+        plot.margin = margin(10, 25, 10, 10))
+
+ggsave(enrich_plot, filename="../figs/dge_revsc_sig_enrichment.pdf",
+       width=3.45, height=2.25)  
+```
+
+### Heatmap of example genes
+```{r}
+genes_show <- intersect(revsc_sig, dge_regional %>%
+              filter(zonation_bin == paste0("Level", 1) &
+                         p_val_adj < 0.05 & 
+                         avg_log2FC > 0.1) %>%
+              pull(Gene))
+
+fc_dat <- dge_regional %>% filter(Gene %in% genes_show) %>%
+  select(Gene, zonation_bin, avg_log2FC) %>%
+  pivot_wider(names_from = Gene, values_from = avg_log2FC) %>%
+  column_to_rownames(var="zonation_bin")
+fc_dat <- fc_dat[5:1,]
+```
+
+```{r}
+col_fun = colorRamp2(seq(-0.5, 0.5, length.out=100), 
+                     rev(colorRampPalette(RColorBrewer::brewer.pal(9, "RdBu"))(100)))
+```
+
+```{r}
+pdf("../figs/revsc_genes_2dpi_fc.pdf", width=3.75, height=2.25)
+Heatmap(fc_dat,
+        name="log2FC",
+        col = col_fun,
+        na_col = "grey95",
+        heatmap_legend_param = list(title_gp = gpar(fontsize = 10)),
+        cluster_rows = F,
+        cluster_columns = T,
+        show_row_dend = F,
+        show_column_dend = F,
+        clustering_method_rows = "ward.D2",
+        show_row_names = T,
+        show_column_names = T,
+        row_names_side = "left",
+        column_names_rot = 45,
+        #column_names_gp = gpar(fontsize = 10),
+        border = FALSE,
+        rect_gp = gpar(col = "black", lwd = 1),
+        width = ncol(fc_dat)*unit(5, "mm"), 
+        height = nrow(fc_dat)*unit(5, "mm"),
+        use_raster=F)
+dev.off()
+```
+
+# Coverage Plots
+```{r}
+DefaultAssay(seurat_ec) <- 'peaks'
+```
+
+## Atg9b
+Activation of an enhancer approx 500bp upstream of TSS in level 1-2. Reduced accessibility of intronic peak at all levels--repressor?
+
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Atg9b", extend.upstream = -2000, extend.downstream = 2000,
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Atg9b", extend.upstream = -2000, extend.downstream = 2000,
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Atg9b.pdf",
+                   base_width=5, base_height=2.25)
+```
+
+## CD44
+Seems like a little bit of a low coverage gene. Seems like the promoter peak pattern at level2 in the 2dpi changes. When it's not expressed, there are two distinct peaks, but there, it seems to expand into one larger open region
+
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Cd44", extend.upstream = -88000, extend.downstream = 2000, #2kb is nice
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Cd44", extend.upstream = -88000, extend.downstream = 2000,
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Cd44.pdf",
+                   base_width=5, base_height=2.25)
+```
+
+## Mboat1
+### Promoter
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Mboat1", extend.upstream = 1000, extend.downstream = -95000, 
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Mboat1", extend.upstream = 1000, extend.downstream = -95000,
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Mboat1-promoter.pdf",
+                   base_width=5, base_height=2.25)
+```
+
+### Enhancer
+Differential enhancer activity ~27k upstream of TSS
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Mboat1", extend.upstream = 29000, extend.downstream = -135000, 
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Mboat1", extend.upstream = 29000, extend.downstream = -135000,
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Mboat1-enhancer-35k-upstream.pdf",
+                   base_width=5, base_height=2.25)
+```
+
+## Mdm2
+No evidence of any interesting changes. Broad accessibility of promoter everywhere. Expression isn't as exclusive as some other genes. If anything, reduced accessibility 2dpi
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Mdm2", extend.upstream = -20000, extend.downstream = 3000, 
+  group.by="zonation_bin",
+  ymax = 80
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Mdm2", extend.upstream = -20000, extend.downstream = 3000,
+  group.by="zonation_bin",
+  ymax = 80
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Mdm2.pdf",
+                   base_width=5, base_height=2.25)
+```
+
+## Ano3
+No ATAC coverage at all
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Ano3", extend.upstream = 20000, extend.downstream = 50000, 
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Ano3", extend.upstream = 20000, extend.downstream = 50000,
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+```
+
+## Mgmt
+Nothing notable
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Mgmt", extend.upstream = 1000, extend.downstream = -225000, 
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Mgmt", extend.upstream = 1000, extend.downstream = -225000,
+  group.by="zonation_bin",
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+```
+
+## Tgfbr2
+Lots of regulatory elements. Lots of accessibility in 0dpi. Maybe some differences in very specific elements?
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Tgfbr2", extend.upstream = -85000, extend.downstream = 50000, 
+  group.by="zonation_bin",
+  ymax = 30
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Tgfbr2", extend.upstream = -85000, extend.downstream = 50000,
+  group.by="zonation_bin", 
+  ymax = 30
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Tgfbr2.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+## Smad2
+
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Smad2", extend.upstream = 20000, extend.downstream = -30000, 
+  group.by="zonation_bin",
+  ymax =40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Smad2", extend.upstream = 20000, extend.downstream = -30000,
+  group.by="zonation_bin", 
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Smad2.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+## Smad3
+
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Smad3", extend.upstream = -100000, extend.downstream = 60000, 
+  group.by="zonation_bin",
+  ymax =40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Smad3", extend.upstream = -100000, extend.downstream = 60000,
+  group.by="zonation_bin", 
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Smad3.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+## Anxa3
+
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Anxa3", extend.upstream = 1000, extend.downstream = -45000, 
+  group.by="zonation_bin", 
+  ymax = 15
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Anxa3", extend.upstream = 1000, extend.downstream = -45000,
+  group.by="zonation_bin", 
+  ymax = 15
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Anxa3.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+## Targeted - Anxa1
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Anxa1", extend.upstream = -16500, extend.downstream = 3000, 
+  group.by="zonation_bin", 
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Anxa1", extend.upstream = -16500, extend.downstream = 3000,
+  group.by="zonation_bin", 
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Anxa1.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+## Targeted - Clu
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Clu", extend.upstream = 500, extend.downstream = -11500, 
+  group.by="zonation_bin", 
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Clu", extend.upstream = 500, extend.downstream = -11500,
+  group.by="zonation_bin", 
+  ymax = 50
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Clu.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+## Targeted - Ly6a
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Ly6a", extend.upstream = 4000, extend.downstream = -500, 
+  group.by="zonation_bin", 
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Ly6a", extend.upstream = 4000, extend.downstream = -500,
+  group.by="zonation_bin", 
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Ly6a.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+## Targeted - Anxa5
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="Anxa5", extend.upstream = 1000, extend.downstream = 10000, 
+  group.by="zonation_bin", 
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="Anxa5", extend.upstream =1000, extend.downstream = 10000,
+  group.by="zonation_bin",
+  ymax = 40
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/Anxa5.pdf",
+                   base_width=5,base_height=2.25)
+```
+
+## Targeted - S100a6
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="S100a6", extend.upstream = 5000, extend.downstream = 18000, 
+  group.by="zonation_bin", 
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="S100a6", extend.upstream =5000, extend.downstream = 18000,
+  group.by="zonation_bin",
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/S100a6.pdf",
+                   base_width=5,base_height=2.25)
+```
+
+## Targeted - F3
+```{r}
+p1 <- CoveragePlot(
+  subset(seurat_ec, time=="0dpi"),
+  region="F3", extend.upstream = 12000, extend.downstream = 1000, 
+  group.by="zonation_bin", 
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+
+p2 <- CoveragePlot(
+  subset(seurat_ec, time=="2dpi"),
+  region="F3", extend.upstream = 12000, extend.downstream = 1000,
+  group.by="zonation_bin",
+  ymax = 25
+) & #operator used by patchwork
+  scale_fill_manual(values=zonation_cols)
+```
+
+```{r}
+coverage_plot <- cowplot::plot_grid(p1, p2, labels = c("0dpi", "2dpi"))
+cowplot::save_plot(coverage_plot, filename = "../figs/CoveragePlots/F3.pdf",
+                   base_width=3.75, base_height=3)
+```
+
+# Zonation - RevSC markers
+Similar to Zonation-pseudotime above, but splitting by timepoint
+```{r}
+plotExpression <- function(gene){
+  df <- data.frame(Pseudotime = seurat_ec$zonation_pseudotime,
+                   Expression = seurat_ec[["RNA"]]@data[gene,],
+                   #Expression = log1p(seurat[["RNA"]]@counts[gene,]),
+                   zonation_bin = seurat_ec$zonation_bin,
+                   time = seurat_ec$time)
+  
+  df <- filter(df, Expression != 0)
+  pseudo_0dpi <- ggplot(df %>% filter(time == '0dpi'), aes(x=Expression, y=Pseudotime)) +
+    geom_point(shape=16, size=1, aes(color=zonation_bin)) +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_x_continuous(expand=c(0,0)) +
+    scale_color_manual(values=zonation_cols) + 
+    ylab("") + xlab("Expression\nlog(CP10k+1)") + ggtitle(paste0("0dpi - ", gene)) +
+    theme_bw() +
+    theme(legend.position="none",
+          axis.text.y = element_blank(),
+          axis.text.x = element_text(size=10, color='black'),
+          axis.title = element_text(size=10),
+          axis.ticks.y = element_blank())
+  
+  pseudo_2dpi <- ggplot(df %>% filter(time == '2dpi'), aes(x=Expression, y=Pseudotime)) +
+    geom_point(shape=16, size=1, aes(color=zonation_bin)) +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_x_continuous(expand=c(0,0)) +
+    scale_color_manual(values=zonation_cols) + 
+    ylab("") + xlab("Expression\nlog(CP10k+1)") + ggtitle(paste0("2dpi - ", gene)) +
+    theme_bw() +
+    theme(legend.position="none",
+          axis.text.y = element_blank(),
+          axis.text.x = element_text(size=10, color='black'),
+          axis.title = element_text(size=10),
+          axis.ticks.y = element_blank())
+  
+  both_plots <- cowplot::plot_grid(pseudo_0dpi, pseudo_2dpi)
+  cowplot::save_plot(both_plots, 
+                     filename= paste0("../figs/expression_pseudotime_timepoint_split_", gene, ".pdf"),
+                     base_width=2.8, base_height=3)
+}
+```
+
+```{r}
+plotExpression("Clu")
+plotExpression("Anxa3")
+plotExpression("Cd44")
+plotExpression("Ly6a")
+plotExpression("S100a6")
+plotExpression("Anxa1")
+plotExpression("Sat1")
+plotExpression("F3")
+plotExpression("Smad2")
+plotExpression("Smad3")
+plotExpression("Tgfbr2")
+```
+
+# Differential peaks
+```{r}
+DefaultAssay(seurat_ec) <- "peaks"
+Idents(seurat_ec) <- seurat_ec$zonation_bin
+seurat_ec$atac_raw_reads_log10 <- log10(seurat_ec$atac_raw_reads)
+
+diffPeaks <- function(level){
+  print(paste0("Differential accessibility for: ", level))
+  da_peaks <- FindMarkers(
+    seurat_ec,
+    ident.1='2dpi', ident.2="0dpi",
+    subset.ident = level, group.by = 'time',
+    test.use = "LR",
+    latent.vars = 'atac_raw_reads_log10',
+    logfc.threshold = 0.5,
+    min.pct = 0.01,
+    only.pos = T
+  )
+  
+  
+  print(paste0("Number of DA peaks: ", nrow(filter(da_peaks, p_val_adj < 0.05))))
+  
+  #Get closests feature
+  print("Getting closest features")
+  closest_feature <- ClosestFeature(seurat_ec, regions = rownames(da_peaks))
+  
+  da_peaks$Region <- rownames(da_peaks)
+  da_peaks$closest_gene <- closest_feature$gene_name
+  da_peaks$closest_feature_type <- closest_feature$type
+  da_peaks$closest_feature_distance <- closest_feature$distance
+  da_peaks$Level <- level
+  return(da_peaks)
+}
+
+all_levels <- paste0("Level", 1:5)
+da_injury <- lapply(all_levels, diffPeaks)
+names(da_injury) <- all_levels
+
+motif_level1 <- FindMotifs(seurat_ec, 
+                           rownames(da_injury[[1]])[da_injury[[1]]$p_val_adj < 0.05])
+
+motif_level2 <- FindMotifs(seurat_ec, 
+                           rownames(da_injury[[2]])[da_injury[[2]]$p_val_adj < 0.05])
+
+motif_level3 <- FindMotifs(seurat_ec, 
+                           rownames(da_injury[[3]])[da_injury[[3]]$p_val_adj < 0.05])
+
+motif_level4 <- FindMotifs(seurat_ec, 
+                           rownames(da_injury[[4]])[da_injury[[4]]$p_val_adj < 0.05])
+
+motif_level5 <- FindMotifs(seurat_ec, 
+                         rownames(da_injury[[5]])[da_injury[[5]]$p_val_adj < 0.05])
+motif_level1$Region <- "Level 1"
+motif_level2$Region <- "Level 2"
+motif_level3$Region <- "Level 3"
+motif_level4$Region <- "Level 4"
+motif_level5$Region <- "Level 5"
+
+
+motif_enrichment_injury <- bind_rows(motif_level1, motif_level2,
+                                     motif_level3, motif_level4,
+                                     motif_level5)
+
+da_injury <- do.call("rbind", da_injury)
+
+write.csv(da_injury, file="../output/da_injury_peaks.csv", 
+          row.names = F)
+write.csv(motif_enrichment_injury, file="../output/da_injury_motifs.csv", 
+          row.names = F)
+```
+
+
+
+
+## Plot DA peak count
+```{r}
+# Getting the peak counts from the output rather than scripting it--lazy
+da_res <- data.frame(Level = c("Level 1", "Level 2", "Level 3",
+                               "Level 4", "Level 5"),
+                     Peak_count = c(714, 476, 235, 228, 16))
+
+da_plot <- ggplot(da_res, aes(x=Peak_count, y=Level)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", aes(fill=Peak_count)) +
+  scale_fill_gradientn(colours=RColorBrewer::brewer.pal(9, "GnBu")) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(da_res$Peak_count+75))) +
+ xlab("Number of regions with\ngained accessibility") + ylab("") + 
+  ggtitle("Regional chromatin accessibility\n(2dpi vs. 0dpi)") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none",
+        plot.margin = margin(10, 25, 10, 10))
+
+ggsave(da_plot, filename="../figs/da_peak_count.pdf",
+       width=3.65, height=2.35) 
+```
+
+## SMAD fold enrichment
+```{r}
+motif_keep <- c("MA0099.3",  #JUN::FOS
+                "MA1964.1",  #SMAD2
+                "MA0808.1") #TEAD3
+
+motif_res <- filter(motif_enrichment_injury, motif %in% motif_keep)
+motif_res$Region <- factor(motif_res$Region, levels=paste0("Level ", 1:5))
+```
+
+```{r}
+enrich_plot <- ggplot(motif_res %>% filter(motif.name=="SMAD2"),
+                      aes(x=-log10(p.adjust), y=Region)) +
+  
+  scale_y_discrete(drop=F) +
+  ylab("") + xlab("-log10(padj)") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.text = element_text(size=10),
+        plot.margin = margin(10, 10, 10, 10))
+
+ggsave(enrich_plot, filename="../figs/da_motif_enrichment.pdf",
+       width=4.5, height=1.85)  
+```
+
+
+```{r}
+enrich_plot <- ggplot(motif_res %>%filter(motif.name == "SMAD2"), 
+                      aes(x=-log10(p.adjust), y=Region)) +
+  geom_col(width=0.025, color="grey20",  fill="grey20") +
+  geom_point(size=5, shape=21, color="black", 
+             fill=RColorBrewer::brewer.pal(3, 'Dark2')[2]) +
+  geom_vline(xintercept = -log10(0.05), linetype=2) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, 2.2)) +
+  scale_y_discrete(drop=F) +
+  ylab("") + xlab("-log10(padj)") + ggtitle("SMAD2 motif enrichment\n(2dpi vs. 0dpi)") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.text = element_text(size=10),
+        plot.margin = margin(10, 10, 10, 10))
+
+ggsave(enrich_plot, filename="../figs/da_injury_smad_enrichment.pdf",
+       width=3.75, height=2.25)  
+```
+
+## SMAD total sites
+```{r}
+count_plot <- ggplot(motif_res %>% filter(motif.name == "SMAD2"), 
+                     aes(x=observed, y=Region)) +
+  geom_col(width=0.025, color="grey20",  fill="grey20") +
+  geom_point(size=5, shape=21, color="black", 
+             fill=RColorBrewer::brewer.pal(3, 'Dark2')[2]) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, 60)) +
+  scale_fill_manual(values = RColorBrewer::brewer.pal(3, 'Dark2')[2],
+                    name="Motif") +
+  scale_y_discrete(drop=F) +
+  ylab("") + xlab("Number of new sites") +
+  ggtitle("Gained SMAD2 binding sites\n(2dpi vs. 0dpi)") +
+  theme_classic() +
+  theme(legend.position='none',
+        axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.text = element_text(size=10),
+        plot.margin = margin(10, 10, 10, 10))
+
+ggsave(count_plot, filename="../figs/da_smad_sites.pdf",
+       width=3.75, height=2.25)  
+```
+
+## SMAD activity - chromVar
+Re-running chromvar because we updated the motif database
+
+```{r}
+library(BSgenome.Mmusculus.ensembl.mm39)
+seurat_ec <- RunChromVAR(
+  object = seurat_ec,
+  genome = BSgenome.Mmusculus.ensembl.mm39
+)
+
+DefaultAssay(seurat_ec) <- 'chromvar'
+```
+
+
+```{r}
+df <- data.frame(Level = seurat_ec$zonation_bin,
+                 Pseudotime = seurat_ec$zonation_pseudotime,
+                 time = seurat_ec$time,
+                 Smad = seurat_ec[['chromvar']]@data['MA1964.1',]) #SMAD2
+df$Level <- factor(df$Level, levels=paste0('Level', 1:5))
+
+smad_plot <- ggplot(df, aes(x=Level, y=Smad)) +
+  geom_boxplot(color='black', aes(fill=time), outlier.size = 0.1, alpha=0.75) +
+  ylab("Inferred SMAD2 activity") + xlab("") +
+  scale_fill_manual(values = c(dpi_cols[9], dpi_cols[1]),
+                    name="") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size=10, color="black"),
+        axis.text.x = element_text(size=12, color="black", angle=45, hjust=1),
+        axis.title = element_text(size=12),
+        legend.text=element_text(size=10))
+
+ggsave(smad_plot, filename="../figs/zonation_smad_chromvar_scores.pdf",
+       width=3.25, height=2.75)
+```
+
+#TEAD chromvar
+```{r}
+df <- data.frame(Level = seurat_ec$zonation_bin,
+                 time = seurat_ec$time,
+                 activity = seurat_ec[['chromvar']]@data['TEAD3',])
+df$Level <- factor(df$Level, levels=paste0('Level', 1:5))
+
+tead_plot <- ggplot(df, aes(x=Level, y=activity)) +
+  geom_boxplot(color='black', aes(fill=time), outlier.size = 0.1, alpha=0.75) +
+  ylab("chromVAR score") + xlab("") +
+  ggtitle("TEAD3 Activity") +
+  scale_fill_manual(values = c(dpi_cols[9], dpi_cols[1]),
+                    name="") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size=10, color="black"),
+        axis.text.x = element_text(size=12, color="black", angle=45, hjust=1),
+        axis.title = element_text(size=12),
+        legend.text=element_text(size=10))
+
+ggsave(tead_plot, filename="../figs/zonation_tead3_activity.pdf",
+       width=3.5, height=2.75)
+```
+## Alternative w/ all TEADs
+```{r}
+df <- data.frame(Level = seurat_ec$zonation_bin,
+                 time = seurat_ec$time,
+                 activity = colMeans(seurat_ec[['chromvar']]@data[c('TEAD1', 'TEAD2', 'TEAD3', 'TEAD4'),]))
+df$Level <- factor(df$Level, levels=paste0('Level', 1:5))
+
+tead_plot <- ggplot(df, aes(x=Level, y=activity)) +
+  geom_boxplot(color='black', aes(fill=time), outlier.size = 0.1, alpha=0.75) +
+  ylab("chromVAR score") + xlab("") +
+  ggtitle("TEAD Activity") +
+  scale_fill_manual(values = c(dpi_cols[9], dpi_cols[1]),
+                    name="") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size=10, color="black"),
+        axis.text.x = element_text(size=12, color="black", angle=45, hjust=1),
+        axis.title = element_text(size=12),
+        legend.text=element_text(size=10))
+
+activity_plot <- ggplot(df, aes(x=Level, y=mean_activity)) +
+  geom_point(shape=21)
+ggsave(tead_plot, filename="../figs/zonation_tead_activity.pdf",
+       width=3.5, height=2.75)
+```
+
+```{r}
+summary(lm(activity ~ time, data = df %>% filter(Level=="Level1")))
+```
+
+
+# TGFB1 expression
+```{r}
+DefaultAssay(seurat) <- "RNA"
+
+plotExpression <- function(gene){
+  df <- data.frame(UMAP1 = Embeddings(seurat, 'wnn.umap')[,1],
+                 UMAP2 = Embeddings(seurat, 'wnn.umap')[,2],
+                 Expression = seurat[["RNA"]]@data[gene,])
+  df <- df[order(df$Expression),]
+  
+  exp_plot <- ggplot(df, aes(x=UMAP1, y=UMAP2)) +
+    geom_point(shape=16, size=0.5, aes(color=Expression)) +
+    ggtitle(gene) +
+    scale_color_gradientn(colours = c("grey90", rev(viridis::magma(100))), 
+                          name="log(CP10k+1)",
+                          guide = guide_colorbar(ticks.colour = "black",
+                                               frame.colour = "black",
+                                               barwidth=0.75, barheight = 3)) +
+    theme_void() + theme(legend.text=element_text(size=10, color="black"))
+  return(exp_plot)
+}
+
+ggsave(plotExpression("Tgfb1"),
+       filename="../figs/Tgfb1_expression.pdf",
+       width=3, height=2.25)
+```
+
+
+# TGFBR2 expression
+```{r}
+df <- data.frame(Level = seurat_ec$zonation_bin,
+                 Pseudotime = seurat_ec$zonation_pseudotime,
+                 time = seurat_ec$time,
+                 Tgfbr2 = seurat_ec[['RNA']]@data['Tgfbr2',])
+df$Level <- factor(df$Level, levels=paste0('Level', 1:5))
+
+tgfbr2_plot <- ggplot(df, aes(x=Level, y=Tgfbr2)) +
+  geom_boxplot(color='black', aes(fill=time), outlier.size = 0.1, alpha=0.75) +
+  ylab("log2(CP10k+1)") + xlab("") +
+  ggtitle("Tgfbr2 expression") +
+  scale_fill_manual(values = c(dpi_cols[9], dpi_cols[1]),
+                    name="") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size=10, color="black"),
+        axis.text.x = element_text(size=12, color="black", angle=45, hjust=1),
+        axis.title = element_text(size=12),
+        legend.text=element_text(size=10))
+
+ggsave(tgfbr2_plot, filename="../figs/zonation_tgfbr2_expression.pdf",
+       width=3.25, height=3)
+```
+
+## Stats
+Not the best given limits of DGE with cells as replicates, but just FYI
+```{r}
+DefaultAssay(seurat_ec) <- "RNA"
+Idents(seurat_ec) <- seurat_ec$zonation_bin
+testGene <- function(Level, Gene){
+  df <- FindMarkers(seurat_ec, features = Gene, ident.1="2dpi", 
+            group.by="time",
+            subset.ident=Level,
+            only.pos=F,
+            logfc.threshold = 0,
+            min.pct=0)
+   df$Level <- Level
+   df$Gene <- Gene
+  return(df)
+}
+
+res <- lapply(paste0("Level",1:5), testGene, Gene="Tgfbr2")
+res$p_val_adj <- p.adjust(res$p_val, method="BH")
+res <- do.call("rbind", res)
+```
+```{r}
+res
+```
+
+
+# SMAD2/3 expression
+```{r}
+df <- data.frame(Level = seurat_ec$zonation_bin,
+                 Pseudotime = seurat_ec$zonation_pseudotime,
+                 time = seurat_ec$time,
+                 Smad2 = seurat_ec[['RNA']]@data['Smad2',],
+                 Smad3 = seurat_ec[['RNA']]@data['Smad3',])
+df$Level <- factor(df$Level, levels=paste0('Level', 1:5))
+
+# Smad2/3 average
+df$Smad2_3 <- rowMeans(df[,c("Smad2", "Smad3")])
+```
+
+```{r}
+df_summary <- df %>%
+  select(Level, time, Smad2, Smad3) %>%
+  pivot_longer(-c(Level, time), names_to="Gene", values_to="Expression") %>%
+  group_by(Level, time, Gene) %>%
+  summarise(Avg = mean(Expression),
+            Pct = sum(Expression > 0) / length(Expression) * 100)
+
+pct <- df_summary$Pct
+
+df_summary <- df_summary %>%
+  group_by(Level, time) %>%
+  summarise(Avg = mean(Avg))
+
+#Scaled -- pulling PCT from chunk above
+df_summary <- df
+df_summary$Smad2 <- scale(df_summary$Smad2)
+df_summary$Smad3 <- scale(df_summary$Smad3)
+df_summary <- df_summary %>%
+  select(Level, time, Smad2, Smad3) %>%
+  pivot_longer(-c(Level, time), names_to="Gene", values_to="Expression") %>%
+  group_by(Level, time, Gene) %>%
+  summarise(Avg = mean(Expression))
+df_summary$Pct <- pct
+```
+
+```{r}
+dot_plot <- ggplot(df_summary, aes(x=time, y=Level)) +
+  geom_point(aes(size = Pct, fill = Avg), color="black", shape=21) +
+  scale_size("% detected", range = c(0,8)) +
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(9, "RdBu")),
+                       limits=c(-0.25,0.25),
+                       oob=squish,
+                       guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black"),
+                       name = "Relative\nexpression\n(Z-score)") +
+  ylab("") + xlab("") +
+  facet_wrap(~Gene) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size=14, angle=45, hjust=1, color="black"),
+        axis.text.y = element_text(size=14, color="black"),
+        axis.title = element_text(size=14),
+        strip.background = element_blank(),
+        strip.text = element_text(size=14, color="black"))
+
+ggsave(dot_plot, filename="../figs/zonation_smad_expression.pdf",
+       width=3.75, height=3.75)
+```
+
+## Stats
+Not the best given limits of DGE with cells as replicates, but just FYI
+```{r}
+DefaultAssay(seurat_ec) <- "RNA"
+Idents(seurat_ec) <- seurat_ec$zonation_bin
+testGene <- function(Level, Gene){
+  df <- FindMarkers(seurat_ec, features = Gene, ident.1="2dpi", 
+            group.by="time",
+            subset.ident=Level,
+            only.pos=F,
+            logfc.threshold = 0,
+            min.pct=0)
+   df$Level <- Level
+   df$Gene <- Gene
+  return(df)
+}
+
+res_smad2 <- lapply(paste0("Level",1:5), testGene, Gene="Smad2")
+res_smad2 <- do.call("rbind", res_smad2)
+res_smad2$p_val_adj <- p.adjust(res_smad2$p_val, method="BH")
+res_smad2
+```
+
+```{r}
+res_smad3 <- lapply(paste0("Level",1:5), testGene, Gene="Smad3")
+res_smad3 <- do.call("rbind", res_smad3)
+res_smad3$p_val_adj <- p.adjust(res_smad3$p_val, method="BH")
+res_smad3
+```
+
+
+
+# Export supp tables
+## Cell metadata w/ zonation
+```{r}
+df <- seurat@meta.data
+df_ec <- seurat_ec@meta.data
+
+df$include_in_zonation <- rownames(df) %in% rownames(df_ec)
+df$scVI_UMAP1 <- NA
+df$scVI_UMAP1[match(rownames(df_ec), rownames(df))] <- Embeddings(seurat_ec, 'scVI')[,1]
+df$scVI_UMAP2 <- NA
+df$scVI_UMAP2[match(rownames(df_ec), rownames(df))] <- Embeddings(seurat_ec, 'scVI')[,2]
+df$zonation_pseudotime <- NA
+df$zonation_pseudotime[match(rownames(df_ec), rownames(df))] <- df_ec$zonation_pseudotime
+df$zonation_bin <- NA
+df$zonation_bin[match(rownames(df_ec), rownames(df))] <- df_ec$zonation_bin
+write.csv(df, file = "../output/metadata_with_pseudotime.csv")
+```
+
+## DGE in each level
+dge_regional exported above
+
+## Motif enrichment injury
+exported above
